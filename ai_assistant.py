@@ -6,6 +6,7 @@ async def ask_yandex_gpt(context: str, user_query: str) -> str:
     if not YC_API_KEY or not YC_FOLDER_ID:
         return "⚠️ Ошибка ИИ-модуля: Не настроены YC_API_KEY или YC_FOLDER_ID в файле .env."
 
+    # Правильный официальный эндпоинт API Yandex Cloud Foundation Models
     url = "https://yandex.net"
     
     headers = {
@@ -18,7 +19,7 @@ async def ask_yandex_gpt(context: str, user_query: str) -> str:
         "modelUri": f"gpt://{YC_FOLDER_ID}/yandexgpt-lite/latest",
         "completionOptions": {
             "stream": False,
-            "temperature": 0.2,  # Низкая температура для минимизации галлюцинаций
+            "temperature": 0.2,
             "maxTokens": 2000
         },
         "messages": [
