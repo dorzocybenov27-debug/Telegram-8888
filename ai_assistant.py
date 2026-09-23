@@ -7,7 +7,7 @@ async def ask_yandex_gpt(context: str, user_query: str) -> str:
         return "⚠️ Ошибка ИИ-модуля: Не настроены YC_API_KEY или YC_FOLDER_ID в файле .env."
 
     # Правильный официальный эндпоинт API Yandex Cloud Foundation Models
-    url = "https://yandex.net"
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
     
     headers = {
         "Authorization": f"Api-Key {YC_API_KEY}",
