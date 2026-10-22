@@ -10,11 +10,12 @@ from config import ADMIN_BOT_TOKEN, ADMIN_IDS
 from database import get_chat_history, save_message
 from ai_assistant import ask_yandex_gpt
 
-# Создаем папку для медиафайлов, если её нет
+# Создаем базовую папку для медиафайлов, если её нет
 os.makedirs("downloads", exist_ok=True)
 
-# Настройка стабильного альтернативного сервера Telegram API для обхода блокировок в РФ
-local_server = TelegramAPIServer.from_base("https://telegram-proxy.org")
+# ИСПРАВЛЕНО: Указан стабильный кастомный сервер Telegram API для обхода блокировок в РФ
+local_server = TelegramAPIServer.from_base("https://api.telegram-proxy.org")
+
 bot = Bot(token=ADMIN_BOT_TOKEN, server=local_server)
 dp = Dispatcher()
 
@@ -33,7 +34,6 @@ async def cmd_export(message: types.Message):
         return
 
     args = message.text.split()
-    # Запрашиваем формат: /export <chat_id> <ДД.ММ.ГГГГ> <ДД.ММ.ГГГГ>
     if len(args) < 4:
         await message.answer(
             "ℹ️ Использование: `/export <chat_id> <дата_начала> <дата_конца>`\n"
@@ -44,13 +44,11 @@ async def cmd_export(message: types.Message):
     try:
         chat_id = int(args[1])
         start_date = datetime.strptime(args[2], "%d.%m.%Y")
-        # Устанавливаем конец дня для даты окончания (23:59:59)
         end_date = datetime.strptime(args[3], "%d.%m.%Y").replace(hour=23, minute=59, second=59)
     except ValueError:
         await message.answer("❌ Некорректный формат параметров. Используйте формат дат: ДД.ММ.ГГГГ")
         return
 
-    # Защитные ограничения (Валидация)
     current_time = datetime.now()
     if start_date > end_date:
         await message.answer("❌ Ошибка: Дата начала не может быть позже даты окончания периода!")
@@ -69,7 +67,6 @@ async def cmd_export(message: types.Message):
         await message.answer("По переписке за выбранный период записей в базе данных не обнаружено.")
         return
 
-    # Формирование CSV в памяти
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Дата (UTC)", "User ID", "Username", "Текст", "Тип медиа", "Путь к медиа", "Реакции"])
@@ -130,43 +127,32 @@ async def handle_new_message(message: types.Message):
         try:
             text = message.text if message.text else message.caption
             media_type = None
-            media_path = None
+            temp_path = None
 
-            # ПУНКТ 3: Физическое сохранение файлов, изображений и голосовых на диск
             if message.photo:
                 media_type = "photo"
-                file_id = message.photo[-1].file_id
-                file_info = await message.bot.get_file(file_id)
-                media_path = f"downloads/photo_{message.message_id}.jpg"
-                await message.bot.download_file(file_info.file_path, media_path)
+                temp_path = f"downloads/photo_{message.message_id}.jpg"
             elif message.document:
                 media_type = "document"
-                file_id = message.document.file_id
-                file_info = await message.bot.get_file(file_id)
-                media_path = f"downloads/doc_{message.message_id}_{message.document.file_name}"
-                await message.bot.download_file(file_info.file_path, media_path)
+                temp_path = f"downloads/doc_{message.message_id}_{message.document.file_name}"
             elif message.voice:
                 media_type = "voice"
-                file_id = message.voice.file_id
-                file_info = await message.bot.get_file(file_id)
-                media_path = f"downloads/voice_{message.message_id}.ogg"
-                await message.bot.download_file(file_info.file_path, media_path)
+                temp_path = f"downloads/voice_{message.message_id}.ogg"
             elif message.video:
                 media_type = "video"
 
-            # ПУНКТ 4: Извлекаем информацию о реакциях при наличии
+            # ПУНКТ 4: Извлекаем информацию о реакциях при наличии (ИСПРАВЛЕНО: Добавлен безопасный перехват hasattr)
             reactions_list = []
-            if message.reactions and hasattr(message.reactions, 'reactions'):
-                for reaction in message.reactions.reactions:
-                    if hasattr(reaction, 'custom_emoji_id') and reaction.custom_emoji_id:
-                        reactions_list.append(f"emoji_id:{reaction.custom_emoji_id}")
-                    elif hasattr(reaction, 'emoji') and reaction.emoji:
-                        reactions_list.append(reaction.emoji)
+            if hasattr(message, 'reaction') and message.reaction and hasattr(message.reaction, 'reactions'):
+                for r in message.reaction.reactions:
+                    if hasattr(r, 'custom_emoji_id') and r.custom_emoji_id:
+                        reactions_list.append(f"emoji_id:{r.custom_emoji_id}")
+                    elif hasattr(r, 'emoji') and r.emoji:
+                        reactions_list.append(r.emoji)
             reactions_str = ",".join(reactions_list) if reactions_list else None
 
-            # Сохранение в PostgreSQL. 
-            # ПУНКТ 8: Передаем точное время отправки сообщения из Telegram (message.date)
-            await save_message(
+            # База данных сама создаст именную папку группы и вернет правильный final_media_path
+            final_media_path = await save_message(
                 chat_id=message.chat.id,
                 chat_title=message.chat.title,
                 message_id=message.message_id,
@@ -174,11 +160,18 @@ async def handle_new_message(message: types.Message):
                 username=message.from_user.username if message.from_user else None,
                 text=text,
                 media_type=media_type,
-                media_path=media_path,
+                media_path=temp_path,
                 reactions=reactions_str,
-                created_at=message.date.replace(tzinfo=None) # Очищаем временную зону для базы данных
+                created_at=message.date.replace(tzinfo=None)
             )
-            print(f"📥 [{message.date.strftime('%X')}] Сообщение/Медиа из чата '{message.chat.title}' записано в PostgreSQL!")
+
+            # Скачиваем файл строго в именную подпапку конкретного чата
+            if temp_path and final_media_path:
+                file_id = message.photo[-1].file_id if message.photo else (message.document.file_id if message.document else message.voice.file_id)
+                file_info = await message.bot.get_file(file_id)
+                await message.bot.download_file(file_info.file_path, final_media_path)
+
+            print(f"📥 [{message.date.strftime('%X')}] Сообщение/Медиа из чата '{message.chat.title}' записано!")
         except Exception as e:
             print(f"Ошибка при обработке и сохранении сообщения: {e}")
 

@@ -1,8 +1,11 @@
 import os
+import re
 from datetime import datetime
 from sqlalchemy import Column, BigInteger, String, DateTime, Text, UniqueConstraint, select
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
+# Импортируем PostgreSQL-инсерт для UPSERT конструкции
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from config import DATABASE_URL
 
 # Инициализация асинхронного движка SQLAlchemy для PostgreSQL
@@ -40,36 +43,44 @@ async def init_db():
 async def save_message(chat_id, chat_title, message_id, user_id, username, text, media_type, media_path, reactions, created_at):
     async with AsyncSessionLocal() as session:
         try:
-            # ПУНКТ 7: Проверка методом "Добавить или обновить" (Upsert) для предотвращения дублирования
-            stmt = select(CorporateMessage).where(
-                CorporateMessage.chat_id == chat_id,
-                CorporateMessage.message_id == message_id
-            )
-            result = await session.execute(stmt)
-            existing_msg = result.scalar_one_or_none()
+            # ИСПРАВЛЕНО: Безопасно очищаем название группы от спецсимволов для создания валидной папки в Linux/Windows
+            safe_title = re.sub(r'[\\/*?:"<>|]', "", chat_title or f"chat_{chat_id}")
+            chat_dir = f"downloads/{safe_title}"
+            os.makedirs(chat_dir, exist_ok=True)
 
-            if existing_msg:
-                # Если сообщение уже есть (например, обновился текст или медиа), обновляем его данные
-                existing_msg.text = text
-                existing_msg.reactions = reactions
-                existing_msg.media_path = media_path
-            else:
-                # Если сообщения нет, создаем новую уникальную запись
-                new_msg = CorporateMessage(
-                    chat_id=chat_id,
-                    chat_title=chat_title,
-                    message_id=message_id,
-                    user_id=user_id,
-                    username=username,
-                    text=text,
-                    media_type=media_type,
-                    media_path=media_path,
-                    reactions=reactions,
-                    created_at=created_at
-                )
-                session.add(new_msg)
+            # Если к сообщению прикреплен файл, перенаправляем путь сохранения внутрь именной папки группы
+            if media_path and media_path.startswith("downloads/"):
+                filename = os.path.basename(media_path)
+                media_path = f"{chat_dir}/{filename}"
+
+            # ПУНКТ 7. Строим атомарную операцию UPSERT (Добавить или Обновить) на уровне СУБД.
+            stmt = pg_insert(CorporateMessage).values(
+                chat_id=chat_id,
+                chat_title=chat_title,
+                message_id=message_id,
+                user_id=user_id,
+                username=username,
+                text=text,
+                media_type=media_type,
+                media_path=media_path,
+                reactions=reactions,
+                created_at=created_at
+            )
             
+            # При возникновении конфликта по уникальному ограничению выполняем UPDATE
+            stmt = stmt.on_conflict_do_update(
+                constraint='_chat_message_uc',
+                set_={
+                    'text': stmt.excluded.text,
+                    'reactions': stmt.excluded.reactions,
+                    'media_path': stmt.excluded.media_path,
+                    'chat_title': stmt.excluded.chat_title  # На случай переименования группы
+                }
+            )
+            
+            await session.execute(stmt)
             await session.commit()
+            return media_path  # Возвращаем скорректированный именной путь наружу для скачивания файлов
         except Exception as e:
             await session.rollback()
             raise e
@@ -88,6 +99,7 @@ async def get_chat_history(chat_id: int, start_date: datetime, end_date: datetim
         )
         result = await session.execute(stmt)
         return result.scalars().all()
+
 async def get_last_message_id(chat_id: int):
     async with AsyncSessionLocal() as session:
         # Ищем максимальный message_id для конкретного чата в нашей базе v2
@@ -99,3 +111,10 @@ async def get_last_message_id(chat_id: int):
         )
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
+
+# ИСПРАВЛЕНО: Добавлена функция извлечения уникальных ID групп, находящихся под наблюдением
+async def get_monitored_chats():
+    async with AsyncSessionLocal() as session:
+        stmt = select(CorporateMessage.chat_id).distinct()
+        result = await session.execute(stmt)
+        return [row for row in result.scalars().all()]
